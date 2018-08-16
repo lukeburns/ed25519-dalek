@@ -1,20 +1,18 @@
 // -*- mode: rust; -*-
 //
-// This file is part of ed25519-dalek.
 // Copyright (c) 2017-2018 Isis Lovecruft
 // See LICENSE for licensing information.
 //
-// Authors:
-// - Isis Agora Lovecruft <isis@patternsinthevoid.net>
+// A fork of https://github.com/dalek-cryptography/ed25519-dalek
 
-//! A Rust implementation of ed25519 EdDSA key generation, signing, and
-//! verification.
+//! A Rust implementation of the Schnorr signature scheme in Ristretto.
 
 use core::default::Default;
 use core::fmt::{Debug};
 
 use rand::CryptoRng;
 use rand::Rng;
+use rand::OsRng;
 
 #[cfg(feature = "serde")]
 use serde::{Serialize, Deserialize};
@@ -35,8 +33,8 @@ use digest::Digest;
 use generic_array::typenum::U64;
 
 use curve25519_dalek::constants;
-use curve25519_dalek::edwards::CompressedEdwardsY;
-use curve25519_dalek::edwards::EdwardsPoint;
+use curve25519_dalek::ristretto::CompressedRistretto;
+use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 
 use errors::SignatureError;
@@ -74,27 +72,8 @@ pub const EXPANDED_SECRET_KEY_LENGTH: usize = EXPANDED_SECRET_KEY_KEY_LENGTH + E
 #[derive(Copy, Eq, PartialEq)]
 #[repr(C)]
 pub struct Signature {
-    /// `R` is an `EdwardsPoint`, formed by using an hash function with
-    /// 512-bits output to produce the digest of:
-    ///
-    /// - the nonce half of the `ExpandedSecretKey`, and
-    /// - the message to be signed.
-    ///
-    /// This digest is then interpreted as a `Scalar` and reduced into an
-    /// element in ℤ/lℤ.  The scalar is then multiplied by the distinguished
-    /// basepoint to produce `R`, and `EdwardsPoint`.
-    pub (crate) R: CompressedEdwardsY,
-
-    /// `s` is a `Scalar`, formed by using an hash function with 512-bits output
-    /// to produce the digest of:
-    ///
-    /// - the `r` portion of this `Signature`,
-    /// - the `PublicKey` which should be used to verify this `Signature`, and
-    /// - the message to be signed.
-    ///
-    /// This digest is then interpreted as a `Scalar` and reduced into an
-    /// element in ℤ/lℤ.
     pub (crate) s: Scalar,
+    pub (crate) e: Scalar,
 }
 
 impl Clone for Signature {
@@ -103,7 +82,7 @@ impl Clone for Signature {
 
 impl Debug for Signature {
     fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-        write!(f, "Signature( R: {:?}, s: {:?} )", &self.R, &self.s)
+        write!(f, "Signature( s: {:?}, e: {:?} )", &self.s, &self.e)
     }
 }
 
@@ -113,8 +92,8 @@ impl Signature {
     pub fn to_bytes(&self) -> [u8; SIGNATURE_LENGTH] {
         let mut signature_bytes: [u8; SIGNATURE_LENGTH] = [0u8; SIGNATURE_LENGTH];
 
-        signature_bytes[..32].copy_from_slice(&self.R.as_bytes()[..]);
-        signature_bytes[32..].copy_from_slice(&self.s.as_bytes()[..]);
+        signature_bytes[..32].copy_from_slice(&self.s.as_bytes()[..]);
+        signature_bytes[32..].copy_from_slice(&self.e.as_bytes()[..]);
         signature_bytes
     }
 
@@ -131,11 +110,7 @@ impl Signature {
         lower.copy_from_slice(&bytes[..32]);
         upper.copy_from_slice(&bytes[32..]);
 
-        if upper[31] & 224 != 0 {
-            return Err(SignatureError(InternalError::ScalarFormatError));
-        }
-
-        Ok(Signature{ R: CompressedEdwardsY(lower), s: Scalar::from_bits(upper) })
+        Ok(Signature{ s: Scalar::from_bytes_mod_order(lower), e: Scalar::from_bytes_mod_order(upper) })
     }
 }
 
@@ -185,11 +160,6 @@ impl Drop for SecretKey {
 }
 
 impl SecretKey {
-    /// Expand this `SecretKey` into an `ExpandedSecretKey`.
-    pub fn expand<D>(&self) -> ExpandedSecretKey where D: Digest<OutputSize = U64> + Default {
-        ExpandedSecretKey::from_secret_key::<D>(&self)
-    }
-
     /// Convert this secret key to a byte array.
     #[inline]
     pub fn to_bytes(&self) -> [u8; SECRET_KEY_LENGTH] {
@@ -316,6 +286,28 @@ impl SecretKey {
 
         sk
     }
+
+    /// Sign a message with this `SecretKey`. A standard Schnorr signature over the Ristretto group with a synthetic nonce.
+    #[allow(non_snake_case)]
+    pub fn sign<D>(&self, message: &[u8]) -> Signature
+            where D: Digest<OutputSize = U64> + Default {
+        let secret_key: Scalar = Scalar::from_bytes_mod_order(self.0);
+        let public_key: RistrettoPoint = &secret_key * &constants::RISTRETTO_BASEPOINT_TABLE;
+
+        let mut csprng = OsRng::new().unwrap();
+        let rand = Scalar::random(&mut csprng);
+        let r = &rand * &public_key; // random nonce `rand` with `secret_key` as a deterministic fallback, "synthetic" https://moderncrypto.org/mail-archive/curves/2017/000925.html
+
+        let mut hash: D = D::default();
+        hash.input(r.compress().as_bytes());
+        hash.input(&message);
+        let e = Scalar::from_hash(hash);
+
+        let s = &(&rand - &e) * &secret_key;
+        assert!(s != Scalar::zero());
+
+        Signature { s, e }
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -345,371 +337,14 @@ impl<'d> Deserialize<'d> for SecretKey {
     }
 }
 
-/// An "expanded" secret key.
-///
-/// This is produced by using an hash function with 512-bits output to digest a
-/// `SecretKey`.  The output digest is then split in half, the lower half being
-/// the actual `key` used to sign messages, after twiddling with some bits.¹ The
-/// upper half is used a sort of half-baked, ill-designed² pseudo-domain-separation
-/// "nonce"-like thing, which is used during signature production by
-/// concatenating it with the message to be signed before the message is hashed.
-//
-// ¹ This results in a slight bias towards non-uniformity at one spectrum of
-// the range of valid keys.  Oh well: not my idea; not my problem.
-//
-// ² It is the author's view (specifically, isis agora lovecruft, in the event
-// you'd like to complain about me, again) that this is "ill-designed" because
-// this doesn't actually provide true hash domain separation, in that in many
-// real-world applications a user wishes to have one key which is used in
-// several contexts (such as within tor, which does does domain separation
-// manually by pre-concatenating static strings to messages to achieve more
-// robust domain separation).  In other real-world applications, such as
-// bitcoind, a user might wish to have one master keypair from which others are
-// derived (à la BIP32) and different domain separators between keys derived at
-// different levels (and similarly for tree-based key derivation constructions,
-// such as hash-based signatures).  Leaving the domain separation to
-// application designers, who thus far have produced incompatible,
-// slightly-differing, ad hoc domain separation (at least those application
-// designers who knew enough cryptographic theory to do so!), is therefore a
-// bad design choice on the part of the cryptographer designing primitives
-// which should be simple and as foolproof as possible to use for
-// non-cryptographers.  Further, later in the ed25519 signature scheme, as
-// specified in RFC8032, the public key is added into *another* hash digest
-// (along with the message, again); it is unclear to this author why there's
-// not only one but two poorly-thought-out attempts at domain separation in the
-// same signature scheme, and which both fail in exactly the same way.  For a
-// better-designed, Schnorr-based signature scheme, see Trevor Perrin's work on
-// "generalised EdDSA" and "VXEdDSA".
-#[repr(C)]
-#[derive(Default)] // we derive Default in order to use the clear() method in Drop
-pub struct ExpandedSecretKey {
-    pub (crate) key: Scalar,
-    pub (crate) nonce: [u8; 32],
-}
-
-/// Overwrite secret key material with null bytes when it goes out of scope.
-impl Drop for ExpandedSecretKey {
-    fn drop(&mut self) {
-        self.key.clear();
-        self.nonce.clear();
-    }
-}
-
-#[cfg(feature = "sha2")]
-impl<'a> From<&'a SecretKey> for ExpandedSecretKey {
-    /// Construct an `ExpandedSecretKey` from a `SecretKey`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # extern crate rand;
-    /// # extern crate sha2;
-    /// # extern crate ed25519_dalek;
-    /// #
-    /// # #[cfg(all(feature = "std", feature = "sha2"))]
-    /// # fn main() {
-    /// #
-    /// use rand::{Rng, OsRng};
-    /// use sha2::Sha512;
-    /// use ed25519_dalek::{SecretKey, ExpandedSecretKey};
-    ///
-    /// let mut csprng: OsRng = OsRng::new().unwrap();
-    /// let secret_key: SecretKey = SecretKey::generate(&mut csprng);
-    /// let expanded_secret_key: ExpandedSecretKey = ExpandedSecretKey::from(&secret_key);
-    /// # }
-    /// #
-    /// # #[cfg(any(not(feature = "std"), not(feature = "sha2")))]
-    /// # fn main() {}
-    /// ```
-    fn from(secret_key: &'a SecretKey) -> ExpandedSecretKey {
-        ExpandedSecretKey::from_secret_key::<Sha512>(&secret_key)
-    }
-}
-
-impl ExpandedSecretKey {
-    /// Convert this `ExpandedSecretKey` into an array of 64 bytes.
-    ///
-    /// # Returns
-    ///
-    /// An array of 64 bytes.  The first 32 bytes represent the "expanded"
-    /// secret key, and the last 32 bytes represent the "domain-separation"
-    /// "nonce".
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # extern crate rand;
-    /// # extern crate sha2;
-    /// # extern crate ed25519_dalek;
-    /// #
-    /// # #[cfg(all(feature = "sha2", feature = "std"))]
-    /// # fn main() {
-    /// #
-    /// use rand::{Rng, OsRng};
-    /// use sha2::Sha512;
-    /// use ed25519_dalek::{SecretKey, ExpandedSecretKey};
-    ///
-    /// let mut csprng: OsRng = OsRng::new().unwrap();
-    /// let secret_key: SecretKey = SecretKey::generate(&mut csprng);
-    /// let expanded_secret_key: ExpandedSecretKey = ExpandedSecretKey::from(&secret_key);
-    /// let expanded_secret_key_bytes: [u8; 64] = expanded_secret_key.to_bytes();
-    ///
-    /// assert!(&expanded_secret_key_bytes[..] != &[0u8; 64][..]);
-    /// # }
-    /// #
-    /// # #[cfg(any(not(feature = "sha2"), not(feature = "std")))]
-    /// # fn main() { }
-    /// ```
-    #[inline]
-    pub fn to_bytes(&self) -> [u8; EXPANDED_SECRET_KEY_LENGTH] {
-        let mut bytes: [u8; 64] = [0u8; 64];
-
-        bytes[..32].copy_from_slice(self.key.as_bytes());
-        bytes[32..].copy_from_slice(&self.nonce[..]);
-        bytes
-    }
-
-    /// Construct an `ExpandedSecretKey` from a slice of bytes.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` whose okay value is an EdDSA `ExpandedSecretKey` or whose
-    /// error value is an `SignatureError` describing the error that occurred.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # extern crate rand;
-    /// # extern crate sha2;
-    /// # extern crate ed25519_dalek;
-    /// #
-    /// # #[cfg(all(feature = "sha2", feature = "std"))]
-    /// # fn do_test() -> Result<ExpandedSecretKey, SignatureError> {
-    /// #
-    /// use rand::{Rng, OsRng};
-    /// use ed25519_dalek::{SecretKey, ExpandedSecretKey};
-    /// use ed25519_dalek::SignatureError;
-    ///
-    /// let mut csprng: OsRng = OsRng::new().unwrap();
-    /// let secret_key: SecretKey = SecretKey::generate(&mut csprng);
-    /// let expanded_secret_key: ExpandedSecretKey = ExpandedSecretKey::from(&secret_key);
-    /// let bytes: [u8; 64] = expanded_secret_key.to_bytes();
-    /// let expanded_secret_key_again = ExpandedSecretKey::from_bytes(&bytes)?;
-    /// #
-    /// # Ok(expanded_secret_key_again)
-    /// # }
-    /// #
-    /// # #[cfg(all(feature = "sha2", feature = "std"))]
-    /// # fn main() {
-    /// #     let result = do_test();
-    /// #     assert!(result.is_ok());
-    /// # }
-    /// #
-    /// # #[cfg(any(not(feature = "sha2"), not(feature = "std")))]
-    /// # fn main() { }
-    /// ```
-    #[inline]
-    pub fn from_bytes(bytes: &[u8]) -> Result<ExpandedSecretKey, SignatureError> {
-        if bytes.len() != EXPANDED_SECRET_KEY_LENGTH {
-            return Err(SignatureError(InternalError::BytesLengthError{
-                name: "ExpandedSecretKey", length: EXPANDED_SECRET_KEY_LENGTH }));
-        }
-        let mut lower: [u8; 32] = [0u8; 32];
-        let mut upper: [u8; 32] = [0u8; 32];
-
-        lower.copy_from_slice(&bytes[00..32]);
-        upper.copy_from_slice(&bytes[32..64]);
-
-        Ok(ExpandedSecretKey{ key:   Scalar::from_bits(lower),
-                              nonce:                   upper  })
-    }
-
-    /// Construct an `ExpandedSecretKey` from a `SecretKey`, using hash function `D`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # extern crate rand;
-    /// # extern crate sha2;
-    /// # extern crate ed25519_dalek;
-    /// #
-    /// # #[cfg(all(feature = "std", feature = "sha2"))]
-    /// # fn main() {
-    /// #
-    /// use rand::{Rng, OsRng};
-    /// use sha2::Sha512;
-    /// use ed25519_dalek::{SecretKey, ExpandedSecretKey};
-    ///
-    /// let mut csprng: OsRng = OsRng::new().unwrap();
-    /// let secret_key: SecretKey = SecretKey::generate(&mut csprng);
-    /// let expanded_secret_key: ExpandedSecretKey = ExpandedSecretKey::from_secret_key::<Sha512>(&secret_key);
-    /// # }
-    /// #
-    /// # #[cfg(any(not(feature = "sha2"), not(feature = "std")))]
-    /// # fn main() { }
-    /// ```
-    pub fn from_secret_key<D>(secret_key: &SecretKey) -> ExpandedSecretKey
-            where D: Digest<OutputSize = U64> + Default {
-        let mut h: D = D::default();
-        let mut hash:  [u8; 64] = [0u8; 64];
-        let mut lower: [u8; 32] = [0u8; 32];
-        let mut upper: [u8; 32] = [0u8; 32];
-
-        h.input(secret_key.as_bytes());
-        hash.copy_from_slice(h.fixed_result().as_slice());
-
-        lower.copy_from_slice(&hash[00..32]);
-        upper.copy_from_slice(&hash[32..64]);
-
-        lower[0]  &= 248;
-        lower[31] &=  63;
-        lower[31] |=  64;
-
-        ExpandedSecretKey{ key: Scalar::from_bits(lower), nonce: upper, }
-    }
-
-    /// Sign a message with this `ExpandedSecretKey`.
-    #[allow(non_snake_case)]
-    pub fn sign<D>(&self, message: &[u8], public_key: &PublicKey) -> Signature
-            where D: Digest<OutputSize = U64> + Default {
-        let mut h: D = D::default();
-        let R: CompressedEdwardsY;
-        let r: Scalar;
-        let s: Scalar;
-        let k: Scalar;
-
-        h.input(&self.nonce);
-        h.input(&message);
-
-        r = Scalar::from_hash(h);
-        R = (&r * &constants::ED25519_BASEPOINT_TABLE).compress();
-
-        h = D::default();
-        h.input(R.as_bytes());
-        h.input(public_key.as_bytes());
-        h.input(&message);
-
-        k = Scalar::from_hash(h);
-        s = &(&k * &self.key) + &r;
-
-        Signature{ R, s }
-    }
-
-    /// Sign a `prehashed_message` with this `ExpandedSecretKey` using the
-    /// Ed25519ph algorithm defined in [RFC8032 §5.1][rfc8032].
-    ///
-    /// # Inputs
-    ///
-    /// * `prehashed_message` is an instantiated hash digest with 512-bits of
-    ///   output which has had the message to be signed previously fed into its
-    ///   state.
-    /// * `public_key` is a [`PublicKey`] which corresponds to this secret key.
-    /// * `context` is an optional context string, up to 255 bytes inclusive,
-    ///   which may be used to provide additional domain separation.  If not
-    ///   set, this will default to an empty string.
-    ///
-    /// # Returns
-    ///
-    /// An Ed25519ph [`Signature`] on the `prehashed_message`.
-    ///
-    /// [rfc8032]: https://tools.ietf.org/html/rfc8032#section-5.1
-    #[allow(non_snake_case)]
-    pub fn sign_prehashed<D>(&self,
-                             prehashed_message: D,
-                             public_key: &PublicKey,
-                             context: Option<&'static [u8]>) -> Signature
-        where D: Digest<OutputSize = U64> + Default
-    {
-        let mut h: D = D::default();
-        let mut prehash: [u8; 64] = [0u8; 64];
-        let R: CompressedEdwardsY;
-        let r: Scalar;
-        let s: Scalar;
-        let k: Scalar;
-
-        let ctx: &[u8] = context.unwrap_or(b""); // By default, the context is an empty string.
-
-        debug_assert!(ctx.len() <= 255, "The context must not be longer than 255 octets.");
-
-        let ctx_len: u8 = ctx.len() as u8;
-
-        // Get the result of the pre-hashed message.
-        prehash.copy_from_slice(prehashed_message.fixed_result().as_slice());
-
-        // This is the dumbest, ten-years-late, non-admission of fucking up the
-        // domain separation I have ever seen.  Why am I still required to put
-        // the upper half "prefix" of the hashed "secret key" in here?  Why
-        // can't the user just supply their own nonce and decide for themselves
-        // whether or not they want a deterministic signature scheme?  Why does
-        // the message go into what's ostensibly the signature domain separation
-        // hash?  Why wasn't there always a way to provide a context string?
-        //
-        // ...
-        //
-        // This is a really fucking stupid bandaid, and the damned scheme is
-        // still bleeding from malleability, for fuck's sake.
-        h.input(b"SigEd25519 no Ed25519 collisions");
-        h.input(&[1]); // Ed25519ph
-        h.input(&[ctx_len]);
-        h.input(ctx);
-        h.input(&self.nonce);
-        h.input(&prehash);
-
-        r = Scalar::from_hash(h);
-        R = (&r * &constants::ED25519_BASEPOINT_TABLE).compress();
-
-        h = D::default();
-        h.input(b"SigEd25519 no Ed25519 collisions");
-        h.input(&[1]); // Ed25519ph
-        h.input(&[ctx_len]);
-        h.input(ctx);
-        h.input(R.as_bytes());
-        h.input(public_key.as_bytes());
-        h.input(&prehash);
-
-        k = Scalar::from_hash(h);
-        s = &(&k * &self.key) + &r;
-
-        Signature{ R, s }
-    }
-
-}
-
-#[cfg(feature = "serde")]
-impl Serialize for ExpandedSecretKey {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: Serializer {
-        serializer.serialize_bytes(&self.to_bytes()[..])
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'d> Deserialize<'d> for ExpandedSecretKey {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: Deserializer<'d> {
-        struct ExpandedSecretKeyVisitor;
-
-        impl<'d> Visitor<'d> for ExpandedSecretKeyVisitor {
-            type Value = ExpandedSecretKey;
-
-            fn expecting(&self, formatter: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                formatter.write_str("An ed25519 expanded secret key as 64 bytes, as specified in RFC8032.")
-            }
-
-            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<ExpandedSecretKey, E> where E: SerdeError {
-                ExpandedSecretKey::from_bytes(bytes).or(Err(SerdeError::invalid_length(bytes.len(), &self)))
-            }
-        }
-        deserializer.deserialize_bytes(ExpandedSecretKeyVisitor)
-    }
-}
-
 /// An ed25519 public key.
 #[derive(Copy, Clone, Default, Eq, PartialEq)]
 #[repr(C)]
-pub struct PublicKey(pub (crate) CompressedEdwardsY);
+pub struct PublicKey(pub (crate) CompressedRistretto);
 
 impl Debug for PublicKey {
     fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-        write!(f, "PublicKey( CompressedEdwardsY( {:?} ))", self.0)
+        write!(f, "PublicKey( CompressedRistretto( {:?} ))", self.0)
     }
 }
 
@@ -731,7 +366,7 @@ impl PublicKey {
     /// # Warning
     ///
     /// The caller is responsible for ensuring that the bytes passed into this
-    /// method actually represent a `curve25519_dalek::curve::CompressedEdwardsY`
+    /// method actually represent a `curve25519_dalek::curve::CompressedRistretto`
     /// and that said compressed point is actually a point on the curve.
     ///
     /// # Example
@@ -771,30 +406,15 @@ impl PublicKey {
         let mut bits: [u8; 32] = [0u8; 32];
         bits.copy_from_slice(&bytes[..32]);
 
-        Ok(PublicKey(CompressedEdwardsY(bits)))
+        Ok(PublicKey(CompressedRistretto(bits)))
     }
 
     /// Derive this public key from its corresponding `SecretKey`.
     #[allow(unused_assignments)]
-    pub fn from_secret<D>(secret_key: &SecretKey) -> PublicKey
-            where D: Digest<OutputSize = U64> + Default {
-
-        let mut h:    D = D::default();
-        let mut hash:   [u8; 64] = [0u8; 64];
-        let mut digest: [u8; 32] = [0u8; 32];
-        let     pk:     [u8; 32];
-
-        h.input(secret_key.as_bytes());
-        hash.copy_from_slice(h.fixed_result().as_slice());
-
-        digest.copy_from_slice(&hash[..32]);
-        digest[0]  &= 248;
-        digest[31] &= 127;
-        digest[31] |= 64;
-
-        pk = (&Scalar::from_bits(digest) * &constants::ED25519_BASEPOINT_TABLE).compress().to_bytes();
-
-        PublicKey(CompressedEdwardsY(pk))
+    pub fn from_secret(secret_key: &SecretKey) -> PublicKey {
+        let secret_key: Scalar = Scalar::from_bytes_mod_order(secret_key.0);
+        let public_key: RistrettoPoint = &secret_key * &constants::RISTRETTO_BASEPOINT_TABLE;
+        PublicKey(public_key.compress())
     }
 
     /// Verify a signature on a message with this keypair's public key.
@@ -806,195 +426,23 @@ impl PublicKey {
     pub fn verify<D>(&self, message: &[u8], signature: &Signature) -> Result<(), SignatureError>
             where D: Digest<OutputSize = U64> + Default
     {
-        let mut h: D = D::default();
-        let R: EdwardsPoint;
-        let k: Scalar;
-
-        let A: EdwardsPoint = match self.0.decompress() {
+        let public_key: RistrettoPoint = match self.0.decompress() {
             Some(x) => x,
             None    => return Err(SignatureError(InternalError::PointDecompressionError)),
         };
 
-        h.input(signature.R.as_bytes());
-        h.input(self.as_bytes());
-        h.input(&message);
+        let r = RistrettoPoint::vartime_double_scalar_mul_basepoint(&signature.e, &public_key, &signature.s);
 
-        k = Scalar::from_hash(h);
-        R = EdwardsPoint::vartime_double_scalar_mul_basepoint(&k, &(-A), &signature.s);
+        let mut hash: D = D::default();
+        hash.input(r.compress().as_bytes());
+        hash.input(&message);
+        let e = Scalar::from_hash(hash);
 
-        if R.compress() == signature.R {
+        if e == signature.e {
             Ok(())
         } else {
             Err(SignatureError(InternalError::VerifyError))
         }
-    }
-
-    /// Verify a `signature` on a `prehashed_message` using the Ed25519ph algorithm.
-    ///
-    /// # Inputs
-    ///
-    /// * `prehashed_message` is an instantiated hash digest with 512-bits of
-    ///   output which has had the message to be signed previously fed into its
-    ///   state.
-    /// * `context` is an optional context string, up to 255 bytes inclusive,
-    ///   which may be used to provide additional domain separation.  If not
-    ///   set, this will default to an empty string.
-    /// * `signature` is a purported Ed25519ph [`Signature`] on the `prehashed_message`.
-    ///
-    /// # Returns
-    ///
-    /// Returns `true` if the `signature` was a valid signature created by this
-    /// `Keypair` on the `prehashed_message`.
-    ///
-    /// [rfc8032]: https://tools.ietf.org/html/rfc8032#section-5.1
-    #[allow(non_snake_case)]
-    pub fn verify_prehashed<D>(&self,
-                               prehashed_message: D,
-                               context: Option<&[u8]>,
-                               signature: &Signature) -> Result<(), SignatureError>
-        where D: Digest<OutputSize = U64> + Default
-    {
-        let mut h: D = D::default();
-        let R: EdwardsPoint;
-        let k: Scalar;
-
-        let ctx: &[u8] = context.unwrap_or(b"");
-        debug_assert!(ctx.len() <= 255, "The context must not be longer than 255 octets.");
-
-        let A: EdwardsPoint = match self.0.decompress() {
-            Some(x) => x,
-            None    => return Err(SignatureError(InternalError::PointDecompressionError)),
-        };
-
-        h.input(b"SigEd25519 no Ed25519 collisions");
-        h.input(&[1]); // Ed25519ph
-        h.input(&[ctx.len() as u8]);
-        h.input(ctx);
-        h.input(signature.R.as_bytes());
-        h.input(self.as_bytes());
-        h.input(prehashed_message.fixed_result().as_slice());
-
-        k = Scalar::from_hash(h);
-        R = EdwardsPoint::vartime_double_scalar_mul_basepoint(&k, &(-A), &signature.s);
-
-        if R.compress() == signature.R {
-            Ok(())
-        } else {
-            Err(SignatureError(InternalError::VerifyError))
-        }
-    }
-}
-
-/// Verify a batch of `signatures` on `messages` with their respective `public_keys`.
-///
-/// # Inputs
-///
-/// * `messages` is a slice of byte slices, one per signed message.
-/// * `signatures` is a slice of `Signature`s.
-/// * `public_keys` is a slice of `PublicKey`s.
-/// * `csprng` is an implementation of `Rng + CryptoRng`, such as `rand::ThreadRng`.
-///
-/// # Panics
-///
-/// This function will panic if the `messages, `signatures`, and `public_keys`
-/// slices are not equal length.
-///
-/// # Returns
-///
-/// * A `Result` whose `Ok` value is an emtpy tuple and whose `Err` value is a
-///   `SignatureError` containing a description of the internal error which
-///   occured.
-///
-/// # Examples
-///
-/// ```
-/// extern crate ed25519_dalek;
-/// extern crate rand;
-/// extern crate sha2;
-///
-/// use ed25519_dalek::verify_batch;
-/// use ed25519_dalek::Keypair;
-/// use ed25519_dalek::PublicKey;
-/// use ed25519_dalek::Signature;
-/// use rand::thread_rng;
-/// use rand::ThreadRng;
-/// use sha2::Sha512;
-///
-/// # fn main() {
-/// let mut csprng: ThreadRng = thread_rng();
-/// let keypairs: Vec<Keypair> = (0..64).map(|_| Keypair::generate::<Sha512, _>(&mut csprng)).collect();
-/// let msg: &[u8] = b"They're good dogs Brant";
-/// let messages: Vec<&[u8]> = (0..64).map(|_| msg).collect();
-/// let signatures:  Vec<Signature> = keypairs.iter().map(|key| key.sign::<Sha512>(&msg)).collect();
-/// let public_keys: Vec<PublicKey> = keypairs.iter().map(|key| key.public).collect();
-///
-/// let result = verify_batch::<Sha512>(&messages[..], &signatures[..], &public_keys[..]);
-/// assert!(result.is_ok());
-/// # }
-/// ```
-#[cfg(any(feature = "alloc", feature = "std"))]
-#[allow(non_snake_case)]
-pub fn verify_batch<D>(messages: &[&[u8]],
-                       signatures: &[Signature],
-                       public_keys: &[PublicKey]) -> Result<(), SignatureError>
-    where D: Digest<OutputSize = U64> + Default
-{
-    const ASSERT_MESSAGE: &'static [u8] = b"The number of messages, signatures, and public keys must be equal.";
-    assert!(signatures.len()  == messages.len(),    ASSERT_MESSAGE);
-    assert!(signatures.len()  == public_keys.len(), ASSERT_MESSAGE);
-    assert!(public_keys.len() == messages.len(),    ASSERT_MESSAGE);
- 
-    #[cfg(feature = "alloc")]
-    use alloc::vec::Vec;
-    #[cfg(feature = "std")]
-    use std::vec::Vec;
-
-    use core::iter::once;
-    use rand::thread_rng;
-
-    use curve25519_dalek::traits::IsIdentity;
-    use curve25519_dalek::traits::VartimeMultiscalarMul;
-
-    // Select a random 128-bit scalar for each signature.
-    let zs: Vec<Scalar> = signatures
-        .iter()
-        .map(|_| Scalar::from(thread_rng().gen::<u128>()))
-        .collect();
-
-    // Compute the basepoint coefficient, ∑ s[i]z[i] (mod l)
-    let B_coefficient: Scalar = signatures
-        .iter()
-        .map(|sig| sig.s)
-        .zip(zs.iter())
-        .map(|(s, z)| z * s)
-        .sum();
-
-    // Compute H(R || A || M) for each (signature, public_key, message) triplet
-    let hrams = (0..signatures.len()).map(|i| {
-        let mut h: D = D::default();
-        h.input(signatures[i].R.as_bytes());
-        h.input(public_keys[i].as_bytes());
-        h.input(&messages[i]);
-        Scalar::from_hash(h)
-    });
-
-    // Multiply each H(R || A || M) by the random value
-    let zhrams = hrams.zip(zs.iter()).map(|(hram, z)| hram * z);
-
-    let Rs = signatures.iter().map(|sig| sig.R.decompress());
-    let As = public_keys.iter().map(|pk| pk.0.decompress());
-    let B = once(Some(constants::ED25519_BASEPOINT_POINT));
-
-    // Compute (-∑ z[i]s[i] (mod l)) B + ∑ z[i]R[i] + ∑ (z[i]H(R||A||M)[i] (mod l)) A[i] = 0
-    let id = EdwardsPoint::optional_multiscalar_mul(
-        once(-B_coefficient).chain(zs.iter().cloned()).chain(zhrams),
-        B.chain(Rs).chain(As),
-    ).ok_or_else(|| SignatureError(InternalError::VerifyError))?;
-
-    if id.is_identity() {
-        Ok(())
-    } else {
-        Err(SignatureError(InternalError::VerifyError))
     }
 }
 
@@ -1124,192 +572,22 @@ impl Keypair {
         where D: Digest<OutputSize = U64> + Default,
               R: CryptoRng + Rng,
     {
-        let sk: SecretKey = SecretKey::generate(csprng);
-        let pk: PublicKey = PublicKey::from_secret::<D>(&sk);
+        let secret: SecretKey = SecretKey::generate(csprng);
+        let public: PublicKey = PublicKey::from_secret(&secret);
 
-        Keypair{ public: pk, secret: sk }
+        Keypair{ public, secret }
     }
 
     /// Sign a message with this keypair's secret key.
     pub fn sign<D>(&self, message: &[u8]) -> Signature
             where D: Digest<OutputSize = U64> + Default {
-        self.secret.expand::<D>().sign::<D>(&message, &self.public)
-    }
-
-    /// Sign a `prehashed_message` with this `Keypair` using the
-    /// Ed25519ph algorithm defined in [RFC8032 §5.1][rfc8032].
-    ///
-    /// # Inputs
-    ///
-    /// * `prehashed_message` is an instantiated hash digest with 512-bits of
-    ///   output which has had the message to be signed previously fed into its
-    ///   state.
-    /// * `context` is an optional context string, up to 255 bytes inclusive,
-    ///   which may be used to provide additional domain separation.  If not
-    ///   set, this will default to an empty string.
-    ///
-    /// # Returns
-    ///
-    /// An Ed25519ph [`Signature`] on the `prehashed_message`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// extern crate ed25519_dalek;
-    /// extern crate rand;
-    /// extern crate sha2;
-    ///
-    /// use ed25519_dalek::Keypair;
-    /// use ed25519_dalek::Signature;
-    /// use rand::thread_rng;
-    /// use rand::ThreadRng;
-    /// use sha2::Sha512;
-    ///
-    /// # #[cfg(all(feature = "std", feature = "sha2"))]
-    /// # fn main() {
-    /// let mut csprng: ThreadRng = thread_rng();
-    /// let keypair: Keypair = Keypair::generate::<Sha512, _>(&mut csprng);
-    /// let message: &[u8] = b"All I want is to pet all of the dogs.";
-    ///
-    /// // Create a hash digest object which we'll feed the message into:
-    /// let prehashed: Sha512 = Sha512::default();
-    ///
-    /// prehashed.input(message);
-    /// # }
-    /// #
-    /// # #[cfg(any(not(feature = "sha2"), not(feature = "std")))]
-    /// # fn main() { }
-    /// ```
-    ///
-    /// If you want, you can optionally pass a "context".  It is generally a
-    /// good idea to choose a context and try to make it unique to your project
-    /// and this specific usage of signatures.
-    ///
-    /// For example, without this, if you were to [convert your OpenPGP key
-    /// to a Bitcoin key][terrible_idea] (just as an example, and also Don't
-    /// Ever Do That) and someone tricked you into signing an "email" which was
-    /// actually a Bitcoin transaction moving all your magic internet money to
-    /// their address, it'd be a valid transaction.
-    ///
-    /// By adding a context, this trick becomes impossible, because the context
-    /// is concatenated into the hash, which is then signed.  So, going with the
-    /// previous example, if your bitcoin wallet used a context of
-    /// "BitcoinWalletAppTxnSigning" and OpenPGP used a context (this is likely
-    /// the least of their safety problems) of "GPGsCryptoIsntConstantTimeLol",
-    /// then the signatures produced by both could never match the other, even
-    /// if they signed the exact same message with the same key.
-    ///
-    /// Let's add a context for good measure (remember, you'll want to choose
-    /// your own!):
-    ///
-    /// ```
-    /// # extern crate ed25519_dalek;
-    /// # extern crate rand;
-    /// # extern crate sha2;
-    /// #
-    /// # use ed25519_dalek::Keypair;
-    /// # use ed25519_dalek::Signature;
-    /// # use rand::thread_rng;
-    /// # use rand::ThreadRng;
-    /// # use sha2::Sha512;
-    /// #
-    /// # #[cfg(all(feature = "std", feature = "sha2"))]
-    /// # fn main() {
-    /// # let mut csprng: ThreadRng = thread_rng();
-    /// # let keypair: Keypair = Keypair::generate::<Sha512, _>(&mut csprng);
-    /// # let message: &[u8] = b"All I want is to pet all of the dogs.";
-    /// # let prehashed: Sha512 = Sha512::default();
-    /// # prehashed.input(message);
-    /// #
-    /// let context: &[u8] = "Ed25519DalekSignPrehashedDoctest";
-    ///
-    /// let sig: Signature = keypair.sign_prehashed(prehashed, Some(context));
-    /// # }
-    /// #
-    /// # #[cfg(any(not(feature = "sha2"), not(feature = "std")))]
-    /// # fn main() { }
-    /// ```
-    ///
-    /// [rfc8032]: https://tools.ietf.org/html/rfc8032#section-5.1
-    /// [terrible_idea]: https://github.com/isislovecruft/scripts/blob/master/gpgkey2bc.py
-    pub fn sign_prehashed<D>(&self,
-                             prehashed_message: D,
-                             context: Option<&'static [u8]>) -> Signature
-        where D: Digest<OutputSize = U64> + Default
-    {
-        self.secret.expand::<D>().sign_prehashed::<D>(prehashed_message, &self.public, context)
+        self.secret.sign::<D>(&message)
     }
 
     /// Verify a signature on a message with this keypair's public key.
     pub fn verify<D>(&self, message: &[u8], signature: &Signature) -> Result<(), SignatureError>
             where D: Digest<OutputSize = U64> + Default {
         self.public.verify::<D>(message, signature)
-    }
-
-    /// Verify a `signature` on a `prehashed_message` using the Ed25519ph algorithm.
-    ///
-    /// # Inputs
-    ///
-    /// * `prehashed_message` is an instantiated hash digest with 512-bits of
-    ///   output which has had the message to be signed previously fed into its
-    ///   state.
-    /// * `context` is an optional context string, up to 255 bytes inclusive,
-    ///   which may be used to provide additional domain separation.  If not
-    ///   set, this will default to an empty string.
-    /// * `signature` is a purported Ed25519ph [`Signature`] on the `prehashed_message`.
-    ///
-    /// # Returns
-    ///
-    /// Returns `true` if the `signature` was a valid signature created by this
-    /// `Keypair` on the `prehashed_message`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// extern crate ed25519_dalek;
-    /// extern crate rand;
-    /// extern crate sha2;
-    ///
-    /// use ed25519_dalek::Keypair;
-    /// use ed25519_dalek::Signature;
-    /// use rand::thread_rng;
-    /// use rand::ThreadRng;
-    /// use sha2::Sha512;
-    ///
-    /// # #[cfg(all(feature = "std", feature = "sha2"))]
-    /// # fn main() {
-    /// let mut csprng: ThreadRng = thread_rng();
-    /// let keypair: Keypair = Keypair::generate::<Sha512, _>(&mut csprng);
-    /// let message: &[u8] = b"All I want is to pet all of the dogs.";
-    ///
-    /// let prehashed: Sha512 = Sha512::default();
-    /// prehashed.input(message);
-    ///
-    /// let context: &[u8] = "Ed25519DalekSignPrehashedDoctest";
-    ///
-    /// let sig: Signature = keypair.sign_prehashed(prehashed, Some(context));
-    ///
-    /// // The sha2::Sha512 struct doesn't implement Copy, so we'll have to create a new one:
-    /// let prehashed_again: Sha512 = Sha512::default();
-    /// prehashed_again.input(message);
-    ///
-    /// let valid: bool = keypair.public.verify_prehashed(prehashed_again, context, sig);
-    ///
-    /// assert!(valid);
-    /// # }
-    /// #
-    /// # #[cfg(any(not(feature = "sha2"), not(feature = "std")))]
-    /// # fn main() { }
-    /// ```
-    ///
-    /// [rfc8032]: https://tools.ietf.org/html/rfc8032#section-5.1
-    pub fn verify_prehashed<D>(&self,
-                               prehashed_message: D,
-                               context: Option<&[u8]>,
-                               signature: &Signature) -> Result<(), SignatureError>
-        where D: Digest<OutputSize = U64> + Default
-    {
-        self.public.verify_prehashed::<D>(prehashed_message, context, signature)
     }
 }
 
@@ -1366,7 +644,7 @@ mod test {
     use super::*;
 
     #[cfg(all(test, feature = "serde"))]
-    static PUBLIC_KEY: PublicKey = PublicKey(CompressedEdwardsY([
+    static PUBLIC_KEY: PublicKey = PublicKey(CompressedRistretto([
         130, 039, 155, 015, 062, 076, 188, 063,
         124, 122, 026, 251, 233, 253, 225, 220,
         014, 041, 166, 120, 108, 035, 254, 077,
@@ -1570,7 +848,7 @@ mod test {
 
             Ok(public_key)
         }
-        assert_eq!(do_the_test(), Ok(PublicKey(CompressedEdwardsY([
+        assert_eq!(do_the_test(), Ok(PublicKey(CompressedRistretto([
             215, 090, 152, 001, 130, 177, 010, 183,
             213, 075, 254, 211, 201, 100, 007, 058,
             014, 225, 114, 243, 218, 166, 035, 037,
